@@ -25,6 +25,7 @@
 #include "referee_decode.h"
 #include "usart_dma.h"
 #include "usart.h"
+#include "hc05_gamepad.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -67,6 +68,7 @@ extern TIM_HandleTypeDef htim1;
 extern TIM_HandleTypeDef htim8;
 extern TIM_HandleTypeDef htim10;
 extern DMA_HandleTypeDef hdma_usart3_rx;
+extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart3;
 extern UART_HandleTypeDef huart6;
 extern TIM_HandleTypeDef htim2;
@@ -242,6 +244,42 @@ void TIM2_IRQHandler(void)
   /* USER CODE BEGIN TIM2_IRQn 1 */
 
   /* USER CODE END TIM2_IRQn 1 */
+}
+
+/**
+  * @brief This function handles USART1 global interrupt.
+  */
+void USART1_IRQHandler(void)
+{
+  /* USER CODE BEGIN USART1_IRQn 0 */
+  const uint32_t status = huart1.Instance->SR;
+  const uint32_t error_flags = status &
+      (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE);
+
+  if (error_flags != 0U)
+  {
+    HC05_Gamepad_NotifyUartError();
+  }
+
+  if ((status & USART_SR_RXNE) != 0U)
+  {
+    const uint8_t byte = (uint8_t)(huart1.Instance->DR & 0xFFU);
+    if (error_flags == 0U)
+    {
+      HC05_Gamepad_FeedByte(byte);
+    }
+  }
+  else if (error_flags != 0U)
+  {
+    /* F4 UART 错误标志通过先读 SR、再读 DR 清除。 */
+    const volatile uint32_t discard = huart1.Instance->DR;
+    (void)discard;
+  }
+  /* USER CODE END USART1_IRQn 0 */
+  /* 不调用 HAL_UART_IRQHandler：该通道使用自定义逐字节接收状态机。 */
+  /* USER CODE BEGIN USART1_IRQn 1 */
+
+  /* USER CODE END USART1_IRQn 1 */
 }
 
 /**

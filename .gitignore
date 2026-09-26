@@ -44,3 +44,14 @@ Thumbs.db
 *.local
 *.user
 *.launch
+
+# WorkBuddy assistant workspace (local memory, not for repo)
+.workbuddy/
+
+# Temporary / diagnostic files generated during dev
+_*.txt
+_*.md
+_*.py
+_*.bat
+_*.ps1
+_*.log

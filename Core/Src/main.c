@@ -36,6 +36,7 @@
 #include "dbus.h"
 #include "usart_dma.h"
 #include "referee_decode.h"
+#include "hc05_gamepad.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -102,6 +103,7 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_CAN1_Init();
+  MX_USART1_UART_Init();
   MX_USART3_UART_Init();
   MX_USART6_UART_Init();
   MX_CAN2_Init();
@@ -113,6 +115,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
   BSP_DWT_Init();
   BSP_CAN_Init();
+  HC05_Gamepad_Init();
+  __HAL_UART_ENABLE_IT(&huart1, UART_IT_RXNE);    // HC-05: PB7, 9600 8N1
   Uart_Init(&huart3, DBUS_Decode);               //接收dbus信息
    __HAL_UART_ENABLE_IT(&huart6, UART_IT_RXNE);   //接收裁判系统信息
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 2500);//2000是闭合，2500是打开

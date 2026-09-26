@@ -71,6 +71,7 @@ add_executable(${CMAKE_PROJECT_NAME}
         Communication/Src/usart_dma.cpp
         Communication/Src/usart_decode.cpp
         Communication/Src/dbus.cpp
+        Communication/Src/hc05_gamepad.cpp
         Communication/Src/usb_decode.cpp
         Communication/Inc/usb_decode.h
         Communication/Src/usb_protocol.cpp
