@@ -1,0 +1,87 @@
+#ifndef __REMOTE_CONTROL_H
+#define __REMOTE_CONTROL_H
+
+#pragma once
+#include "main.h"
+#include <stdint.h>
+
+#ifndef UART_RX_BUF_LEN
+#define UART_RX_BUF_LEN 256
+#endif
+
+#ifndef DT7DMA_MAX_INSTANCES
+#define DT7DMA_MAX_INSTANCES 3   // 支持最多 3 个 UART/UsartDma 实例（可按需调整）
+#endif
+
+#ifdef __cplusplus
+class UsartDma
+{
+public:
+    using DecodeCallback = void (*)(volatile uint8_t* buf, int len);
+
+    UsartDma(UART_HandleTypeDef* huart, DecodeCallback cb);
+
+    // IRQHandler 在 USART3_IRQHandler() 中调用
+    static void IRQHandler(UART_HandleTypeDef* huart);
+
+    // 可在需要时查询实例（例如测试）
+    static UsartDma* GetInstance(UART_HandleTypeDef* huart) {
+        return findInstance(huart);
+    }
+
+    // 通过 DMA 发送数据
+    HAL_StatusTypeDef Transmit_DMA(const uint8_t* data, uint16_t len);
+
+private:
+    UART_HandleTypeDef* huart_;
+    DecodeCallback decode_cb_;  // 回调函数指针
+
+    //接收相关
+    volatile uint8_t rx_buf_[2][UART_RX_BUF_LEN] = {0};
+    int rx_data_len_;
+    uint8_t callback_busy_ = 0;
+
+    volatile uint8_t  tx_busy_ = 0;
+
+    static inline UsartDma* instances_[DT7DMA_MAX_INSTANCES] = { nullptr };
+
+    // 注册 / 查找（在 cpp 中实现）
+    static int registerInstance(UsartDma* inst);
+    static UsartDma* findInstance(UART_HandleTypeDef* huart);
+
+    void Init();
+    void uartRxIdleCallback();
+    void uartTxCpltCallback();
+    void dmaM0RxCpltCallback();
+    void dmaM1RxCpltCallback();
+
+    static HAL_StatusTypeDef DMAEx_MultiBufferStart_NoIT(DMA_HandleTypeDef* hdma,
+                                                         uint32_t SrcAddress,
+                                                         uint32_t DstAddress,
+                                                         uint32_t SecondMemAddress,
+                                                         uint32_t DataLength);
+};
+#endif
+
+/* --------- 对 C 文件暴露的接口 --------- */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+    // 初始化 USART DMA 双缓冲接收
+    void Uart_Init(UART_HandleTypeDef* huart,
+                    void (*decode_func)(volatile uint8_t* buf, int len));
+
+    // IRQHandler，供 stm32f4xx_it.c 调用
+    void Uart_IRQHandler(UART_HandleTypeDef* huart);
+
+    // 通过 DMA 发送数据
+    HAL_StatusTypeDef Uart_Transmit_DMA(UART_HandleTypeDef* huart,
+                                     const uint8_t* data,
+                                     uint16_t len);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

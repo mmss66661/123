@@ -1,0 +1,46 @@
+# Build artifacts
+build/
+Debug/
+Release/
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.axf
+*.map
+*.lst
+*.out
+*.d
+*.su
+*.a
+*.lib
+
+# CMake / IDE
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+cmake-build-*/
+compile_commands.json
+.vscode/
+.idea/
+*.code-workspace
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# STM32CubeMX / generated extras
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Local env / debug
+*.local
+*.user
+*.launch
