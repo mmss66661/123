@@ -79,7 +79,21 @@ add_executable(${CMAKE_PROJECT_NAME}
         Communication/Src/referee_protocol.cpp
         Communication/Inc/referee_protocol.h
         Communication/Src/referee_decode.cpp
-        Communication/Inc/referee_decode.h)
+        Communication/Inc/referee_decode.h
+        RobotArm/Src/arm_math.cpp
+        RobotArm/Inc/arm_math.h
+        RobotArm/Src/kinematics.cpp
+        RobotArm/Inc/kinematics.h
+        RobotArm/Src/trajectory.cpp
+        RobotArm/Inc/trajectory.h
+        RobotArm/Src/arm_hal_dm.cpp
+        RobotArm/Inc/arm_hal.h
+        RobotArm/Src/arm_controller.cpp
+        RobotArm/Inc/arm_controller.h
+        RobotArm/Inc/arm_types.h
+        RobotArm/Inc/arm_config.h
+        Task/Src/armTask.cpp
+        Task/Inc/armTask.h)
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
@@ -110,6 +124,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         Message_Bus
         Control
         Control/Inc
+        RobotArm/Inc
 )
 
 # Add project symbols (macros)

@@ -55,3 +55,5 @@ _*.py
 _*.bat
 _*.ps1
 _*.log
+__pycache__/
+*.pyc

@@ -25,10 +25,14 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "hc05_gamepad.h"
 extern void MasterBoardTask_Init(void);
 extern void ImuTask_Init(void);
 extern void MotorTask_Init(void);
 extern void USBTask_Init(void);
+/* 机械臂控制框架任务（RobotArm/）。与 MotorTask 驱动同一组电机，
+ * 二者不能同时运行：启用 ArmTask 前先注释掉下方的 MotorTask_Init()。 */
+/* extern void ArmTask_Init(void); */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -118,11 +122,14 @@ void MX_FREERTOS_Init(void) {
   //电机驱动任务
   MotorTask_Init();
 
+  //机械臂控制框架任务：与上面的 MotorTask 互斥，切换时注释掉 MotorTask_Init()
+  //ArmTask_Init();
+
   //主板任务
   //MasterBoardTask_Init();
 
   //IMU任务
-  // ImuTask_Init();
+   ImuTask_Init();
   /* USER CODE END RTOS_THREADS */
 
 }
@@ -142,7 +149,8 @@ void StartDefaultTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+    /* PA0 独立测试模式下，RGB LED 完全由 MotorTask 的真实状态控制。 */
+    osDelay(10);
   }
   /* USER CODE END StartDefaultTask */
 }
