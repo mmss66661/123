@@ -100,6 +100,7 @@ public:
     //DM Motor CAN发送函数接口
     HAL_StatusTypeDef BSP_CAN1_DMMotorDisableCmd(uint16_t ID, uint16_t mode);
     HAL_StatusTypeDef BSP_CAN1_DMMotorEnableCmd(uint16_t ID, uint16_t mode);
+    HAL_StatusTypeDef BSP_CAN1_DMMotorRefreshStatusCmd(uint16_t ID);
     HAL_StatusTypeDef BSP_CAN1_DMMotorPositionCmd(int16_t ID, float position, float velocity);
     HAL_StatusTypeDef BSP_CAN1_DMMotorVelocityCmd(int16_t ID, float velocity);
     HAL_StatusTypeDef BSP_CAN1_DMMotorMitCmd(int16_t ID, float pos, float vel, float kp, float kd, float torq);

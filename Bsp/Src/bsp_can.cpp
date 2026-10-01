@@ -25,13 +25,16 @@ DJI_motor_info motor_5;
 DJI_motor_info motor_6;
 
 DM_motor_info DM_motor_1;
-//达妙(DM)六关节机械臂，反馈ID = 电机ID + 0x10
-DM_motor_info DM_motor_J0;  //J0 底部 yaw   电机ID=0x02, 反馈ID=0x12
-DM_motor_info DM_motor_J1;  //J1 底部 pitch 电机ID=0x03, 反馈ID=0x13
-DM_motor_info DM_motor_J2;  //J2 roll       电机ID=0x04, 反馈ID=0x14
-DM_motor_info DM_motor_J3;  //J3 末端 yaw   电机ID=0x05, 反馈ID=0x15
-DM_motor_info DM_motor_J4;  //J4 pitch/yaw  电机ID=0x06, 反馈ID=0x16
-DM_motor_info DM_motor_J5;  //J5 pitch/yaw  电机ID=0x07, 反馈ID=0x17
+// 达妙(DM)六关节机械臂。反馈仲裁 ID 为各电机独立配置的 Master ID，
+// 接收时通过数据 D[0] 中的电机 ID 识别关节。
+DM_motor_info DM_motor_J0;  // J0 底部 yaw，CAN ID=0x02
+DM_motor_info DM_motor_J1;  // J1 底部 pitch，CAN ID=0x03
+DM_motor_info DM_motor_J2;  // J2 roll，CAN ID=0x04
+DM_motor_info DM_motor_J3;  // J3 末端 yaw，CAN ID=0x05
+DM_motor_info DM_motor_J4;  // J4 pitch/yaw，CAN ID=0x06
+DM_motor_info DM_motor_J5;  // J5 pitch/yaw，CAN ID=0x07
+// 最近一次从各电机收到反馈时使用的 Master ID，便于核对电机上位机配置。
+volatile uint16_t DM_feedback_master_id[6] = {};
 
 LK_motor_info LK_motor_1;
 LK_motor_info LK_motor_2;
@@ -181,6 +184,7 @@ HAL_StatusTypeDef bsp_can::BSP_CAN1_DMMotorDisableCmd(uint16_t ID, uint16_t mode
     uint8_t TxData[8];
     uint32_t TxMailbox;
 
+    // 本机械臂电机沿用已验证过的模式偏移寻址方式。
     TxHeader.StdId = ID + mode;
     TxHeader.IDE = CAN_ID_STD;
     TxHeader.RTR = CAN_RTR_DATA;
@@ -204,6 +208,7 @@ HAL_StatusTypeDef bsp_can::BSP_CAN1_DMMotorEnableCmd(uint16_t ID, uint16_t mode)
     uint8_t TxData[8];
     uint32_t TxMailbox;
 
+    // 本机械臂电机沿用已验证过的模式偏移寻址方式。
     TxHeader.StdId = ID + mode;
     TxHeader.IDE = CAN_ID_STD;
     TxHeader.RTR = CAN_RTR_DATA;
@@ -218,6 +223,23 @@ HAL_StatusTypeDef bsp_can::BSP_CAN1_DMMotorEnableCmd(uint16_t ID, uint16_t mode)
     TxData[6] = 0xFF;
     TxData[7] = 0xFC;
 
+    return HAL_CAN_AddTxMessage(&hcan1, &TxHeader, TxData, &TxMailbox);
+}
+
+// DM 状态刷新：失能状态下使用 0x7FF / 0xCC 主动请求一次标准状态反馈。
+HAL_StatusTypeDef bsp_can::BSP_CAN1_DMMotorRefreshStatusCmd(uint16_t ID) {
+    CAN_TxHeaderTypeDef TxHeader = {};
+    uint8_t TxData[8] = {};
+    uint32_t TxMailbox;
+
+    TxHeader.StdId = 0x7FFU;
+    TxHeader.IDE = CAN_ID_STD;
+    TxHeader.RTR = CAN_RTR_DATA;
+    TxHeader.DLC = 8U;
+
+    TxData[0] = static_cast<uint8_t>(ID & 0xFFU);
+    TxData[1] = static_cast<uint8_t>((ID >> 8U) & 0xFFU);
+    TxData[2] = 0xCCU;
     return HAL_CAN_AddTxMessage(&hcan1, &TxHeader, TxData, &TxMailbox);
 }
 
@@ -603,6 +625,26 @@ static void update_dm_motor_info(DM_motor_info* motor, const uint8_t* data)
     motor->rx_count++;
 }
 
+// 达妙反馈帧的仲裁 ID 是可独立配置的 Master ID，不能假定恒为 CAN_ID + 0x10。
+// 数据 D[0] 的低四位才是发送反馈的电机 CAN ID。
+static bool try_update_dm_motor_info(uint32_t master_id, uint32_t dlc,
+                                     const uint8_t* data)
+{
+    if (master_id > 0x7FFU || dlc != 8U) return false;
+
+    const uint8_t motor_id = data[0] & 0x0FU;
+    if (motor_id < 0x02U || motor_id > 0x07U) return false;
+
+    const uint8_t joint = static_cast<uint8_t>(motor_id - 0x02U);
+    DM_motor_info* const motors[6] = {
+        &DM_motor_J0, &DM_motor_J1, &DM_motor_J2,
+        &DM_motor_J3, &DM_motor_J4, &DM_motor_J5
+    };
+    update_dm_motor_info(motors[joint], data);
+    DM_feedback_master_id[joint] = static_cast<uint16_t>(master_id);
+    return true;
+}
+
 //辅助函数：更新瓴控电机反馈信息
 void update_lk_motor_info(LK_motor_info* motor, const uint8_t* data)
 {
@@ -676,14 +718,6 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
         }
         else if(hcan->Instance == CAN1) {
             switch(RxHeader.StdId) {
-                //达妙(DM)六关节电机反馈 (反馈ID = 电机ID + 0x10)
-                case 0x12: { update_dm_motor_info(&DM_motor_J0, RxData); break; }  //J0 底部 yaw
-                case 0x13: { update_dm_motor_info(&DM_motor_J1, RxData); break; }  //J1 底部 pitch
-                case 0x14: { update_dm_motor_info(&DM_motor_J2, RxData); break; }  //J2 roll
-                case 0x15: { update_dm_motor_info(&DM_motor_J3, RxData); break; }  //J3 末端 yaw
-                case 0x16: { update_dm_motor_info(&DM_motor_J4, RxData); break; }  //J4 pitch/yaw
-                case 0x17: { update_dm_motor_info(&DM_motor_J5, RxData); break; }  //J5 pitch/yaw
-
                 //处理ID为1、2、3的瓴控电机反馈
                 case 0x141:
                 case 0x142:
@@ -738,7 +772,10 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
                     chassis.spinvelocity = static_cast<int16_t>((RxData[0] << 8) | RxData[1]);
                     break;
                 }
-                default: break;
+                default: {
+                    try_update_dm_motor_info(RxHeader.StdId, RxHeader.DLC, RxData);
+                    break;
+                }
             }
         }
     }

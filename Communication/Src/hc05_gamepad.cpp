@@ -14,6 +14,43 @@ uint8_t frame_used = 0U;
 bool have_sequence = false;
 uint8_t last_sequence = 0U;
 uint8_t gripper_state = 3U;  // 与 main.c 的上电默认状态一致：夹爪打开。
+volatile uint16_t last_buttons = 0U;
+volatile uint8_t operation_mode = 0U;
+
+void set_runtime_indicator(uint8_t indicator) {
+    uint32_t set_pins = GPIO_PIN_11;  // 停止：绿灯
+    uint32_t reset_pins = GPIO_PIN_10 | GPIO_PIN_12;
+    if (indicator == HC05_INDICATOR_OFF) {
+        set_pins = 0U;
+        reset_pins = GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12;
+    } else if (indicator == HC05_INDICATOR_RECORDING) {
+        set_pins = GPIO_PIN_11 | GPIO_PIN_12;  // 录制：红 + 绿 = 黄
+        reset_pins = GPIO_PIN_10;
+    } else if (indicator == HC05_INDICATOR_PLAYBACK) {
+        set_pins = GPIO_PIN_12;  // 回放：红灯
+        reset_pins = GPIO_PIN_10 | GPIO_PIN_11;
+    } else if (indicator == HC05_INDICATOR_FAULT_FEEDBACK) {
+        set_pins = GPIO_PIN_10;  // 反馈/CAN 故障：蓝灯
+        reset_pins = GPIO_PIN_11 | GPIO_PIN_12;
+    } else if (indicator == HC05_INDICATOR_FAULT_MOTOR) {
+        set_pins = GPIO_PIN_10 | GPIO_PIN_12;  // 电机报码：紫灯
+        reset_pins = GPIO_PIN_11;
+    } else if (indicator == HC05_INDICATOR_FAULT_FLASH) {
+        set_pins = GPIO_PIN_10 | GPIO_PIN_11;  // Flash 故障：青灯
+        reset_pins = GPIO_PIN_12;
+    } else if (indicator == HC05_INDICATOR_FAULT_DATA) {
+        set_pins = GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12;  // 数据/限位：白灯
+        reset_pins = 0U;
+    }
+    GPIOH->BSRR = set_pins | (reset_pins << 16U);
+}
+
+void stop_operation(void) {
+    operation_mode = 0U;
+    hc05_gamepad.operation_mode = 0U;
+    dbus.s2 = 0U;
+    set_runtime_indicator(HC05_INDICATOR_STOP);
+}
 
 uint16_t read_u16_le(const uint8_t *data) {
     return static_cast<uint16_t>(data[0]) |
@@ -57,27 +94,32 @@ void update_dbus_compatibility(const HC05_GamepadState &state, uint32_t now) {
 
     const bool close_pressed = (state.buttons & HC05_BUTTON_A) != 0U;
     const bool open_pressed = (state.buttons & HC05_BUTTON_B) != 0U;
-    const bool enable_pressed = (state.buttons & HC05_BUTTON_RB) != 0U;
-    if (enable_pressed && close_pressed != open_pressed) {
+    if (close_pressed != open_pressed) {
         gripper_state = close_pressed ? 1U : 3U;
     }
-    dbus.s1 = enable_pressed ? gripper_state : 2U;
+    dbus.s1 = (close_pressed || open_pressed) ? gripper_state : 2U;
 
-    const bool record_pressed = (state.buttons & HC05_BUTTON_BACK) != 0U;
-    const bool playback_pressed = (state.buttons & HC05_BUTTON_START) != 0U;
-    if (!enable_pressed || (record_pressed && playback_pressed)) {
-        dbus.s2 = 0U;  // 松开安全键或模式冲突时失能。
-    } else if (!record_pressed && !playback_pressed) {
-        dbus.s2 = 2U;  // 按住 RB 且无模式键：手动挡。
-    } else {
-        dbus.s2 = record_pressed ? 1U : 3U;
+    // 只在按下沿切换工作状态，松开按钮后状态继续保持。
+    const uint16_t pressed = static_cast<uint16_t>(state.buttons & ~last_buttons);
+    last_buttons = state.buttons;
+    if ((pressed & HC05_BUTTON_START) != 0U) {
+        operation_mode = 0U;  // START 优先级最高，立即停止。
+        ++hc05_gamepad.start_press_count;
+    } else if ((pressed & HC05_BUTTON_RB) != 0U) {
+        operation_mode = 1U;  // RB 单击开始录制。
+        ++hc05_gamepad.mode_press_count;
+    } else if ((pressed & HC05_BUTTON_LB) != 0U) {
+        operation_mode = 3U;  // LB 单击开始回放。
+        ++hc05_gamepad.mode_press_count;
     }
+    dbus.s2 = operation_mode;
+    hc05_gamepad.operation_mode = operation_mode;
 
     dbus.mouse.x = 0;
     dbus.mouse.y = 0;
     dbus.mouse.z = 0;
-    dbus.mouse.l = (enable_pressed && close_pressed) ? 1U : 0U;
-    dbus.mouse.r = (enable_pressed && open_pressed) ? 1U : 0U;
+    dbus.mouse.l = close_pressed ? 1U : 0U;
+    dbus.mouse.r = open_pressed ? 1U : 0U;
     dbus.key = state.buttons;
 
     // 最后发布时戳和帧计数，任务层不会把半更新的数据当成新帧。
@@ -174,8 +216,11 @@ void HC05_Gamepad_Init(void) {
     frame_used = 0U;
     have_sequence = false;
     last_sequence = 0U;
+    last_buttons = 0U;
+    operation_mode = 0U;
     gripper_state = 3U;
     std::memset((void *)&hc05_gamepad, 0, sizeof(hc05_gamepad));
+    stop_operation();
 }
 
 void HC05_Gamepad_FeedByte(uint8_t byte) {
@@ -214,6 +259,16 @@ void HC05_Gamepad_NotifyUartError(void) {
 bool HC05_Gamepad_IsFresh(uint32_t now, uint32_t timeout_ms) {
     return hc05_gamepad.frame_count != 0U &&
            (now - hc05_gamepad.last_update_tick) <= timeout_ms;
+}
+
+void HC05_Gamepad_UpdateIndicator(uint32_t now, uint32_t timeout_ms) {
+    if (!HC05_Gamepad_IsFresh(now, timeout_ms)) {
+        stop_operation();
+    }
+}
+
+void HC05_Gamepad_SetRuntimeIndicator(uint8_t indicator) {
+    set_runtime_indicator(indicator);
 }
 
 }  // extern "C"

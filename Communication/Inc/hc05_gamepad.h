@@ -10,6 +10,18 @@ extern "C" {
 
 #define HC05_GAMEPAD_FRAME_SIZE       20U
 #define HC05_GAMEPAD_PROTOCOL_VERSION 0x01U
+#define HC05_GAMEPAD_LINK_TIMEOUT_MS  100U
+
+enum {
+    HC05_INDICATOR_STOP = 0U,
+    HC05_INDICATOR_RECORDING = 1U,
+    HC05_INDICATOR_PLAYBACK = 2U,
+    HC05_INDICATOR_FAULT_FEEDBACK = 3U,
+    HC05_INDICATOR_FAULT_MOTOR = 4U,
+    HC05_INDICATOR_FAULT_FLASH = 5U,
+    HC05_INDICATOR_FAULT_DATA = 6U,
+    HC05_INDICATOR_OFF = 7U
+};
 
 enum {
     HC05_BUTTON_A     = (1U << 0),
@@ -40,6 +52,9 @@ typedef struct {
     uint8_t rt;
     int8_t hat_x;
     int8_t hat_y;
+    volatile uint8_t operation_mode;  // 0=停止，1=录制，3=回放
+    volatile uint32_t start_press_count;
+    volatile uint32_t mode_press_count;
 
     volatile uint32_t last_update_tick;
     volatile uint32_t frame_count;
@@ -55,6 +70,8 @@ void HC05_Gamepad_Init(void);
 void HC05_Gamepad_FeedByte(uint8_t byte);
 void HC05_Gamepad_NotifyUartError(void);
 bool HC05_Gamepad_IsFresh(uint32_t now, uint32_t timeout_ms);
+void HC05_Gamepad_UpdateIndicator(uint32_t now, uint32_t timeout_ms);
+void HC05_Gamepad_SetRuntimeIndicator(uint8_t indicator);
 
 #ifdef __cplusplus
 }

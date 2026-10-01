@@ -5,6 +5,8 @@
 #include "../Inc/motorTask.h"
 #include "bsp_can.h"
 #include "dbus.h"
+#include "hc05_gamepad.h"
+#include "main.h"
 #include "tim.h"
 #include "stm32f4xx_hal_flash_ex.h"
 
@@ -26,6 +28,13 @@ volatile uint8_t  arm_control_state = 0;
 volatile uint32_t arm_record_sample_count = 0;
 volatile uint32_t arm_playback_sample_index = 0;
 volatile uint32_t arm_fault_code = 0;
+volatile uint32_t arm_missing_feedback_mask = 0;
+volatile uint32_t arm_motor_error_mask = 0;
+volatile int32_t  arm_can_tx_failed_joint = -1;
+volatile uint8_t  arm_remote_raw_mode = 0;
+volatile uint8_t  arm_requested_mode = 0;
+volatile uint32_t arm_pa0_press_count = 0;
+volatile uint8_t  arm_pa0_mode = 0;
 
 namespace {
 constexpr std::size_t JOINT_COUNT = 6;
@@ -74,9 +83,18 @@ constexpr uint32_t RECORD_PERIOD_MS     = 10U;          // 100 Hz
 
 constexpr uint32_t DBUS_TIMEOUT_MS      = 100U;
 constexpr uint32_t FEEDBACK_TIMEOUT_MS  = 100U;
+constexpr uint32_t FEEDBACK_REQUEST_TIMEOUT_MS = 20U;
+constexpr uint32_t FEEDBACK_REQUEST_RETRIES = 3U;
 constexpr uint32_t MOTOR_STARTUP_DELAY_MS = 2000U;
-constexpr uint32_t SWITCH_SETTLE_MS       = 200U;
-constexpr uint32_t PLAYBACK_SWITCH_HOLD_MS = 600U;
+constexpr uint32_t STARTUP_ENABLE_TEST_MS  = 1000U;
+constexpr uint32_t STARTUP_TEST_PERIOD_MS  = 10U;
+constexpr uint32_t SWITCH_SETTLE_MS       = 50U;
+constexpr uint32_t PLAYBACK_SWITCH_HOLD_MS = 50U;
+constexpr bool PA0_BUTTON_TEST_MODE       = true;
+constexpr uint32_t PA0_DEBOUNCE_MS        = 30U;
+// Temporary diagnostic switch: disable the arm-specific software travel limits
+// and recorded-step guard. Keep finite-value/DM protocol-range validation active.
+constexpr bool SOFTWARE_POSITION_LIMITS_ENABLED = false;
 constexpr float RETURN_SPEED            = 0.30f;        // rad/s
 constexpr float PLAYBACK_MAX_SPEED      = 2.0f;         // rad/s
 constexpr float RETURN_TOLERANCE        = 0.04f;        // rad
@@ -135,6 +153,12 @@ enum FaultCode : uint32_t {
     FAULT_UNSAFE_SAMPLE = 10
 };
 
+enum class FeedbackPollResult : uint8_t {
+    Ok = 0,
+    TxError = 1,
+    Timeout = 2
+};
+
 struct JointSnapshot {
     uint16_t pos_raw[JOINT_COUNT];
     float pos[JOINT_COUNT];
@@ -168,6 +192,26 @@ struct SwitchFilter {
     uint8_t active = 0U;
     uint32_t candidate_since = 0U;
 };
+
+struct ButtonFilter {
+    bool candidate_pressed = false;
+    bool stable_pressed = false;
+    uint32_t candidate_since = 0U;
+};
+
+bool pa0_button_press_event(ButtonFilter& filter, uint32_t now) {
+    const bool pressed = HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin) == GPIO_PIN_RESET;
+    if (pressed != filter.candidate_pressed) {
+        filter.candidate_pressed = pressed;
+        filter.candidate_since = now;
+    }
+    if (filter.stable_pressed != filter.candidate_pressed &&
+        (now - filter.candidate_since) >= PA0_DEBOUNCE_MS) {
+        filter.stable_pressed = filter.candidate_pressed;
+        return filter.stable_pressed;
+    }
+    return false;
+}
 
 float dbus_deadzone(int16_t value) {
     if (value > CTRL_DEAD) return static_cast<float>(value - CTRL_DEAD);
@@ -237,11 +281,55 @@ bool feedback_is_fresh(const JointSnapshot& snapshot, uint32_t now) {
 }
 
 bool feedback_has_error(const JointSnapshot& snapshot) {
+    uint32_t error_mask = 0U;
     for (std::size_t i = 0; i < JOINT_COUNT; ++i) {
         // 达妙反馈高四位的 0/1 分别是失能/使能状态，8~E 才是故障。
-        if (snapshot.err[i] >= 8U) return true;
+        if (snapshot.err[i] >= 8U) error_mask |= (1UL << i);
     }
-    return false;
+    arm_motor_error_mask = error_mask;
+    return error_mask != 0U;
+}
+
+void update_joint_fault_blink(uint32_t now, uint32_t joint_mask,
+                              uint8_t fault_indicator) {
+    if (joint_mask == 0U) {
+        HC05_Gamepad_SetRuntimeIndicator(fault_indicator);
+        return;
+    }
+
+    uint8_t joint = 0U;
+    while (joint + 1U < JOINT_COUNT &&
+           (joint_mask & (1UL << joint)) == 0U) {
+        ++joint;
+    }
+
+    // 每 3 秒重复一组：粉色闪 1~6 次分别表示 J0~J5，单次亮灭各 150 ms。
+    const uint32_t phase = now % 3000U;
+    const uint32_t pulse_window = static_cast<uint32_t>(joint + 1U) * 300U;
+    const bool led_on = phase < pulse_window && (phase % 300U) < 150U;
+    HC05_Gamepad_SetRuntimeIndicator(led_on ? fault_indicator
+                                            : HC05_INDICATOR_OFF);
+}
+
+void update_fault_blink(uint32_t now, FaultCode fault) {
+    if (fault == FAULT_MOTOR_ERROR) {
+        update_joint_fault_blink(now, arm_motor_error_mask,
+                                 HC05_INDICATOR_FAULT_MOTOR);
+        return;
+    }
+
+    if (fault == FAULT_FEEDBACK_TIMEOUT) {
+        update_joint_fault_blink(now, arm_missing_feedback_mask,
+                                 HC05_INDICATOR_FAULT_FEEDBACK);
+        return;
+    }
+
+    if (fault == FAULT_CAN_TX && arm_can_tx_failed_joint >= 0 &&
+        arm_can_tx_failed_joint < static_cast<int32_t>(JOINT_COUNT)) {
+        update_joint_fault_blink(now,
+                                 1UL << static_cast<uint32_t>(arm_can_tx_failed_joint),
+                                 HC05_INDICATOR_FAULT_FEEDBACK);
+    }
 }
 
 bool remote_is_fresh(uint32_t now) {
@@ -257,33 +345,114 @@ bool disable_all_motors(bsp_can& can) {
     return ok;
 }
 
-// 达妙为一发一收模式。录制时电机保持失能，但仍需逐个发送失能命令，
-// 用命令回复获得这一采样周期的新位置反馈。
-bool poll_disabled_feedback(bsp_can& can, JointSnapshot& snapshot) {
-    JointSnapshot before{};
-    take_joint_snapshot(before);
+// 达妙为一发一收模式。录制时电机保持失能，逐个发送状态刷新请求取得新位置反馈。
+FeedbackPollResult poll_disabled_feedback(bsp_can& can, JointSnapshot& snapshot) {
+    arm_missing_feedback_mask = 0U;
+    arm_can_tx_failed_joint = -1;
 
+    // 达妙为一发一收模式。逐台请求并等待对应反馈，避免连续六帧后统一等待
+    // 导致慢回复或偶发丢帧把整个机械臂误判为离线。
     for (std::size_t i = 0; i < JOINT_COUNT; ++i) {
-        if (can.BSP_CAN1_DMMotorDisableCmd(DM_CAN_IDS[i], DM_POS_MODE) != HAL_OK) {
-            return false;
-        }
-        osDelay(1);
-    }
+        bool updated = false;
+        bool request_sent = false;
+        for (uint32_t retry = 0U; retry < FEEDBACK_REQUEST_RETRIES; ++retry) {
+            JointSnapshot before{};
+            take_joint_snapshot(before);
 
-    const uint32_t deadline = HAL_GetTick() + 10U;
-    for (;;) {
-        take_joint_snapshot(snapshot);
-        bool all_updated = true;
-        for (std::size_t i = 0; i < JOINT_COUNT; ++i) {
-            if (snapshot.rx_count[i] == before.rx_count[i]) {
-                all_updated = false;
-                break;
+            if (can.BSP_CAN1_DMMotorRefreshStatusCmd(DM_CAN_IDS[i]) == HAL_OK) {
+                request_sent = true;
+                const uint32_t deadline = HAL_GetTick() + FEEDBACK_REQUEST_TIMEOUT_MS;
+                do {
+                    take_joint_snapshot(snapshot);
+                    if (snapshot.rx_count[i] != before.rx_count[i]) {
+                        updated = true;
+                        break;
+                    }
+                    osDelay(1);
+                } while (!tick_reached(HAL_GetTick(), deadline));
+            }
+            if (updated) break;
+
+            // 兼容不支持 0x7FF/0xCC 状态刷新的旧固件：回退到原失能命令取反馈。
+            take_joint_snapshot(before);
+            if (can.BSP_CAN1_DMMotorDisableCmd(DM_CAN_IDS[i], DM_POS_MODE) == HAL_OK) {
+                request_sent = true;
+                const uint32_t deadline = HAL_GetTick() + FEEDBACK_REQUEST_TIMEOUT_MS;
+                do {
+                    take_joint_snapshot(snapshot);
+                    if (snapshot.rx_count[i] != before.rx_count[i]) {
+                        updated = true;
+                        break;
+                    }
+                    osDelay(1);
+                } while (!tick_reached(HAL_GetTick(), deadline));
+            }
+            if (updated) break;
+
+            if (!request_sent && retry + 1U == FEEDBACK_REQUEST_RETRIES) {
+                arm_can_tx_failed_joint = static_cast<int32_t>(i);
+                return FeedbackPollResult::TxError;
             }
         }
-        if (all_updated) return true;
-        if (tick_reached(HAL_GetTick(), deadline)) return false;
-        osDelay(1);
+
+        if (!updated) {
+            arm_missing_feedback_mask |= (1UL << i);
+        }
     }
+
+    take_joint_snapshot(snapshot);
+    return arm_missing_feedback_mask == 0U
+               ? FeedbackPollResult::Ok
+               : FeedbackPollResult::Timeout;
+}
+
+bool handle_feedback_poll_result(FeedbackPollResult result, FaultCode& fault) {
+    switch (result) {
+        case FeedbackPollResult::Ok:
+            return true;
+        case FeedbackPollResult::TxError:
+            fault = FAULT_CAN_TX;
+            return false;
+        case FeedbackPollResult::Timeout:
+        default:
+            fault = FAULT_FEEDBACK_TIMEOUT;
+            return false;
+    }
+}
+
+void record_enable_failure(std::size_t joint) {
+    arm_can_tx_failed_joint = static_cast<int32_t>(joint);
+}
+
+void clear_enable_diagnostics() {
+    arm_can_tx_failed_joint = -1;
+    arm_motor_error_mask = 0U;
+}
+
+bool wait_for_mode_feedback(bsp_can& can, JointSnapshot& snapshot,
+                            FaultCode& fault) {
+    const FeedbackPollResult result = poll_disabled_feedback(can, snapshot);
+    return handle_feedback_poll_result(result, fault);
+}
+
+bool enable_all_at_current_position(bsp_can& can, const JointSnapshot& snapshot) {
+    clear_enable_diagnostics();
+    for (std::size_t i = 0; i < JOINT_COUNT; ++i) {
+        if (can.BSP_CAN1_DMMotorEnableCmd(DM_CAN_IDS[i], DM_POS_MODE) != HAL_OK) {
+            record_enable_failure(i);
+            disable_all_motors(can);
+            return false;
+        }
+        osDelay(2);
+        if (can.BSP_CAN1_DMMotorPositionCmd(DM_CAN_IDS[i], snapshot.pos[i],
+                                            RETURN_SPEED) != HAL_OK) {
+            record_enable_failure(i);
+            disable_all_motors(can);
+            return false;
+        }
+        osDelay(2);
+    }
+    return true;
 }
 
 uint8_t update_switch_filter(SwitchFilter& filter, uint8_t raw, uint32_t now) {
@@ -320,22 +489,6 @@ bool send_joint_positions(bsp_can& can, const float target[JOINT_COUNT],
     return true;
 }
 
-bool enable_all_at_current_position(bsp_can& can, const JointSnapshot& snapshot) {
-    for (std::size_t i = 0; i < JOINT_COUNT; ++i) {
-        if (can.BSP_CAN1_DMMotorEnableCmd(DM_CAN_IDS[i], DM_POS_MODE) != HAL_OK) {
-            disable_all_motors(can);
-            return false;
-        }
-        osDelay(2);
-        if (can.BSP_CAN1_DMMotorPositionCmd(DM_CAN_IDS[i], snapshot.pos[i],
-                                            RETURN_SPEED) != HAL_OK) {
-            disable_all_motors(can);
-            return false;
-        }
-        osDelay(2);
-    }
-    return true;
-}
 
 uint32_t crc32_update(uint32_t crc, const uint8_t* data, std::size_t length) {
     for (std::size_t i = 0; i < length; ++i) {
@@ -402,6 +555,8 @@ bool positions_are_safe(const float target[JOINT_COUNT]) {
         }
     }
 
+    if (!SOFTWARE_POSITION_LIMITS_ENABLED) return true;
+
     if (target[0] < J0_LIMIT_LO - LIMIT_TOLERANCE ||
         target[0] > J0_LIMIT_HI + LIMIT_TOLERANCE ||
         target[1] < J1_MIN - LIMIT_TOLERANCE ||
@@ -442,7 +597,7 @@ bool validate_record(RecordHeader& header) {
         if (!positions_are_safe(target) || !gripper_state_is_valid(sample.gripper_state))
             return false;
 
-        if (index != 0U) {
+        if (SOFTWARE_POSITION_LIMITS_ENABLED && index != 0U) {
             for (std::size_t joint = 0; joint < JOINT_COUNT; ++joint) {
                 if (std::fabs(target[joint] - previous[joint]) > MAX_RECORDED_STEP) {
                     return false;
@@ -506,12 +661,21 @@ float maximum_error(const float target[JOINT_COUNT], const JointSnapshot& snapsh
 }
 
 void sync_manual_targets(ManualTargets& target, const JointSnapshot& snapshot) {
-    target.j0 = std::clamp(wrap_j0(snapshot.pos[0]), J0_LIMIT_LO, J0_LIMIT_HI);
-    target.j1 = std::clamp(snapshot.pos[1], J1_MIN, J1_MAX);
-    target.j2 = std::clamp(snapshot.pos[2], J2_MIN, J2_MAX);
+    target.j0 = SOFTWARE_POSITION_LIMITS_ENABLED
+                    ? std::clamp(wrap_j0(snapshot.pos[0]), J0_LIMIT_LO, J0_LIMIT_HI)
+                    : snapshot.pos[0];
+    target.j1 = SOFTWARE_POSITION_LIMITS_ENABLED
+                    ? std::clamp(snapshot.pos[1], J1_MIN, J1_MAX)
+                    : snapshot.pos[1];
+    target.j2 = SOFTWARE_POSITION_LIMITS_ENABLED
+                    ? std::clamp(snapshot.pos[2], J2_MIN, J2_MAX)
+                    : snapshot.pos[2];
     target.j3 = snapshot.pos[3];
-    target.wrist_pitch = std::clamp(
-        wrap_wrist_delta(snapshot.pos[4] - snapshot.pos[5]), J45_LOW, J45_HIGH);
+    const float wrist_delta = snapshot.pos[4] - snapshot.pos[5];
+    target.wrist_pitch = SOFTWARE_POSITION_LIMITS_ENABLED
+                             ? std::clamp(wrap_wrist_delta(wrist_delta),
+                                          J45_LOW, J45_HIGH)
+                             : wrist_delta;
 }
 
 bool run_manual_control(bsp_can& can, ManualTargets& target,
@@ -522,17 +686,23 @@ bool run_manual_control(bsp_can& can, ManualTargets& target,
     const float c3 = dbus_deadzone(dbus.ch[3]);
     const float c4 = dbus_deadzone(dbus.ch[4]);
 
-    target.j0 = std::clamp(target.j0 + c0 * CTRL_INC, J0_LIMIT_LO, J0_LIMIT_HI);
+    target.j0 += c0 * CTRL_INC;
+    if (SOFTWARE_POSITION_LIMITS_ENABLED)
+        target.j0 = std::clamp(target.j0, J0_LIMIT_LO, J0_LIMIT_HI);
     if (can.BSP_CAN1_DMMotorPositionCmd(DM_CAN_IDS[0], target.j0, POS_MAX_VEL) != HAL_OK)
         return false;
     osDelay(2);
 
-    target.j1 = std::clamp(target.j1 + c1 * CTRL_INC, J1_MIN, J1_MAX);
+    target.j1 += c1 * CTRL_INC;
+    if (SOFTWARE_POSITION_LIMITS_ENABLED)
+        target.j1 = std::clamp(target.j1, J1_MIN, J1_MAX);
     if (can.BSP_CAN1_DMMotorPositionCmd(DM_CAN_IDS[1], target.j1, POS_MAX_VEL) != HAL_OK)
         return false;
     osDelay(2);
 
-    target.j2 = std::clamp(target.j2 + c2 * CTRL_INC, J2_MIN, J2_MAX);
+    target.j2 += c2 * CTRL_INC;
+    if (SOFTWARE_POSITION_LIMITS_ENABLED)
+        target.j2 = std::clamp(target.j2, J2_MIN, J2_MAX);
     if (can.BSP_CAN1_DMMotorPositionCmd(DM_CAN_IDS[2], target.j2, POS_MAX_VEL) != HAL_OK)
         return false;
     osDelay(2);
@@ -542,9 +712,13 @@ bool run_manual_control(bsp_can& can, ManualTargets& target,
         return false;
     osDelay(2);
 
-    target.wrist_pitch = std::clamp(target.wrist_pitch + c4 * CTRL_INC,
-                                    J45_LOW, J45_HIGH);
-    const float current_pitch = wrap_wrist_delta(snapshot.pos[4] - snapshot.pos[5]);
+    target.wrist_pitch += c4 * CTRL_INC;
+    if (SOFTWARE_POSITION_LIMITS_ENABLED)
+        target.wrist_pitch = std::clamp(target.wrist_pitch, J45_LOW, J45_HIGH);
+    const float raw_current_pitch = snapshot.pos[4] - snapshot.pos[5];
+    const float current_pitch = SOFTWARE_POSITION_LIMITS_ENABLED
+                                    ? wrap_wrist_delta(raw_current_pitch)
+                                    : raw_current_pitch;
     const float pitch_error = target.wrist_pitch - current_pitch;
     const float wrist_target[2] = {
         snapshot.pos[4] + pitch_error * 0.5f,
@@ -584,20 +758,31 @@ void MotorTask::run() {
     ControlState state = ControlState::Safe;
     ManualTargets manual_target{};
     PlaybackContext playback{};
-    bool controls_armed = false;
     bool motors_enabled = false;
     uint32_t record_crc = 0xFFFFFFFFU;
     uint32_t record_count = 0U;
     uint32_t record_next_tick = 0U;
     uint32_t manual_tx_failures = 0U;
+    uint32_t handled_start_press_count = 0U;
+    uint32_t handled_mode_press_count = 0U;
     SwitchFilter switch_filter{};
-    bool fault_manual_release_seen = false;
+    ButtonFilter pa0_button_filter{};
+    uint8_t pa0_mode = 0U;
     // main.c 上电时将夹爪初始化为打开状态。
     uint8_t current_gripper_state = 3U;
 
     auto set_state = [&](ControlState next) {
         state = next;
         arm_control_state = static_cast<uint8_t>(next);
+        if (next == ControlState::Recording) {
+            HC05_Gamepad_SetRuntimeIndicator(HC05_INDICATOR_RECORDING);
+        } else if (next == ControlState::ReturnToStart ||
+                   next == ControlState::Playback ||
+                   next == ControlState::PlaybackComplete) {
+            HC05_Gamepad_SetRuntimeIndicator(HC05_INDICATOR_PLAYBACK);
+        } else {
+            HC05_Gamepad_SetRuntimeIndicator(HC05_INDICATOR_STOP);
+        }
     };
 
     auto enter_fault = [&](FaultCode fault) {
@@ -606,22 +791,110 @@ void MotorTask::run() {
             motors_enabled = false;
         }
         arm_fault_code = fault;
-        // 手动挡内发生故障时，必须先离开手动挡再拨回，禁止自动反复重使能。
-        fault_manual_release_seen = (dbus.s2 != 2U);
         set_state(ControlState::Fault);
+        if (fault == FAULT_MOTOR_ERROR) {
+            HC05_Gamepad_SetRuntimeIndicator(HC05_INDICATOR_FAULT_MOTOR);
+        } else if (fault == FAULT_FLASH_ERASE || fault == FAULT_FLASH_PROGRAM) {
+            HC05_Gamepad_SetRuntimeIndicator(HC05_INDICATOR_FAULT_FLASH);
+        } else if (fault == FAULT_RECORD_INVALID || fault == FAULT_UNSAFE_SAMPLE) {
+            HC05_Gamepad_SetRuntimeIndicator(HC05_INDICATOR_FAULT_DATA);
+        } else {
+            HC05_Gamepad_SetRuntimeIndicator(HC05_INDICATOR_FAULT_FEEDBACK);
+        }
     };
 
     // 达妙上电初始化约 1 秒；留足 2 秒后再发送第一帧 CAN 命令。
     osDelay(MOTOR_STARTUP_DELAY_MS);
 
-    // 上电默认失能；必须先收到有效遥控数据并经过 S2=2 才能进入任何运动状态。
-    disable_all_motors(ABC);
-    set_state(ControlState::Safe);
+    // PA0 测试模式：上电默认停止并失能，等待板载按键的第一次按下。
+    // PA0 test mode: after the two-second driver boot delay, briefly enable every
+    // joint at its measured position. This exercises the real enable path without
+    // commanding a move, then returns to the disabled recording-ready state.
+    if (PA0_BUTTON_TEST_MODE) {
+        JointSnapshot startup_snapshot{};
+        FaultCode startup_fault = FAULT_NONE;
+
+        if (!wait_for_mode_feedback(ABC, startup_snapshot, startup_fault) ||
+            !feedback_is_fresh(startup_snapshot, HAL_GetTick())) {
+            if (startup_fault == FAULT_NONE) startup_fault = FAULT_FEEDBACK_TIMEOUT;
+            enter_fault(startup_fault);
+        } else {
+            float hold_position[JOINT_COUNT]{};
+            for (std::size_t i = 0; i < JOINT_COUNT; ++i) {
+                hold_position[i] = startup_snapshot.pos[i];
+            }
+
+            HC05_Gamepad_SetRuntimeIndicator(HC05_INDICATOR_RECORDING);
+            if (!enable_all_at_current_position(ABC, startup_snapshot)) {
+                enter_fault(FAULT_CAN_TX);
+            } else {
+                motors_enabled = true;
+                uint32_t detected_error_mask = 0U;
+                for (std::size_t i = 0; i < JOINT_COUNT; ++i) {
+                    if (startup_snapshot.err[i] >= 8U) {
+                        detected_error_mask |= (1UL << i);
+                    }
+                }
+
+                const uint32_t test_deadline = HAL_GetTick() + STARTUP_ENABLE_TEST_MS;
+                uint32_t next_test_tick = HAL_GetTick();
+                while (!tick_reached(HAL_GetTick(), test_deadline)) {
+                    const uint32_t test_now = HAL_GetTick();
+                    if (!tick_reached(test_now, next_test_tick)) {
+                        osDelay(1);
+                        continue;
+                    }
+
+                    JointSnapshot live_snapshot{};
+                    take_joint_snapshot(live_snapshot);
+                    for (std::size_t i = 0; i < JOINT_COUNT; ++i) {
+                        if (live_snapshot.err[i] >= 8U) {
+                            detected_error_mask |= (1UL << i);
+                        }
+                    }
+
+                    if (!feedback_is_fresh(live_snapshot, test_now)) {
+                        startup_fault = FAULT_FEEDBACK_TIMEOUT;
+                        break;
+                    }
+                    if (!send_joint_positions(ABC, hold_position, RETURN_SPEED, 1U)) {
+                        startup_fault = FAULT_CAN_TX;
+                        break;
+                    }
+                    schedule_next_tick(test_now, next_test_tick,
+                                       STARTUP_TEST_PERIOD_MS);
+                }
+
+                disable_all_motors(ABC);
+                motors_enabled = false;
+                arm_motor_error_mask = detected_error_mask;
+                if (detected_error_mask != 0U) {
+                    enter_fault(FAULT_MOTOR_ERROR);
+                } else if (startup_fault != FAULT_NONE) {
+                    enter_fault(startup_fault);
+                } else {
+                    arm_fault_code = FAULT_NONE;
+                    set_state(ControlState::Safe);
+                }
+            }
+        }
+    } else {
+        disable_all_motors(ABC);
+        set_state(ControlState::Safe);
+    }
+
+    // Keep a startup diagnostic fault latched. With mode 0 the normal stop branch
+    // intentionally clears faults, so use the record request value until PA0 is
+    // pressed; the Fault branch still prevents recording or enabling any motor.
+    if (PA0_BUTTON_TEST_MODE && state == ControlState::Fault) {
+        pa0_mode = 1U;
+        arm_pa0_mode = pa0_mode;
+    }
 
     for (;;) {
         const uint32_t now = HAL_GetTick();
 
-        if (!remote_is_fresh(now)) {
+        if (!PA0_BUTTON_TEST_MODE && !remote_is_fresh(now)) {
             if (state == ControlState::Recording && record_count != 0U) {
                 if (!finalize_record(record_count, record_crc)) {
                     arm_fault_code = FAULT_FLASH_PROGRAM;
@@ -631,34 +904,107 @@ void MotorTask::run() {
                 disable_all_motors(ABC);
                 motors_enabled = false;
             }
-            controls_armed = false;
             arm_fault_code = FAULT_DBUS_TIMEOUT;
             set_state(ControlState::Safe);
             osDelay(5);
             continue;
         }
 
-        const uint8_t requested_mode = update_switch_filter(switch_filter, dbus.s2, now);
-
-        // 回放挡内不接受实时 S1，避免覆盖 Flash 中记录的夹爪动作。
-        // 返回起点期间保持进入回放前的夹爪状态；正式回放后由采样点驱动。
-        if (requested_mode != 3U) {
-            update_gripper_from_remote(current_gripper_state);
+        if (PA0_BUTTON_TEST_MODE && pa0_button_press_event(pa0_button_filter, now)) {
+            ++arm_pa0_press_count;
+            switch (state) {
+                case ControlState::Recording:
+                case ControlState::RecordStopped:
+                    pa0_mode = 3U;  // 录制结束并回放。
+                    break;
+                case ControlState::ReturnToStart:
+                case ControlState::Playback:
+                    pa0_mode = 0U;  // 回放过程中强制失能。
+                    break;
+                case ControlState::PlaybackComplete:
+                case ControlState::Safe:
+                case ControlState::Manual:
+                    pa0_mode = 1U;  // 新一轮录制。
+                    break;
+                case ControlState::Fault:
+                default:
+                    arm_fault_code = FAULT_NONE;
+                    set_state(ControlState::Safe);
+                    pa0_mode = 1U;  // 故障后按一次按键直接重新录制。
+                    break;
+            }
+            arm_pa0_mode = pa0_mode;
         }
 
-        // 开机、掉线恢复或非法开关值后，先拨到中位完成安全解锁。
-        if (!controls_armed) {
-            if (requested_mode == 2U) {
-                controls_armed = true;
-                arm_fault_code = FAULT_NONE;
-            } else {
+        if (!PA0_BUTTON_TEST_MODE) {
+            // START 使用独立的按下计数，因此在已经停止时再次单击也能触发一次清除。
+            const uint32_t start_press_count = hc05_gamepad.start_press_count;
+            if (start_press_count != handled_start_press_count) {
+                handled_start_press_count = start_press_count;
                 if (motors_enabled) {
                     disable_all_motors(ABC);
                     motors_enabled = false;
+                } else {
+                    disable_all_motors(ABC);
                 }
+
+                set_state(ControlState::Safe);
+                if (!erase_record_sector()) {
+                    enter_fault(FAULT_FLASH_ERASE);
+                    osDelay(5);
+                    continue;
+                }
+
+                record_crc = 0xFFFFFFFFU;
+                record_count = 0U;
+                arm_record_sample_count = 0U;
+                arm_playback_sample_index = 0U;
+                arm_fault_code = FAULT_NONE;
+                switch_filter = {};
+                arm_remote_raw_mode = 0U;
+                arm_requested_mode = 0U;
                 set_state(ControlState::Safe);
                 osDelay(5);
                 continue;
+            }
+
+            const uint32_t mode_press_count = hc05_gamepad.mode_press_count;
+            const bool new_mode_request = mode_press_count != handled_mode_press_count;
+            if (new_mode_request) {
+                handled_mode_press_count = mode_press_count;
+                if (state == ControlState::Fault) {
+                    arm_fault_code = FAULT_NONE;
+                    switch_filter = {};
+                    set_state(ControlState::Safe);
+                }
+            }
+        }
+
+        const uint8_t requested_mode = PA0_BUTTON_TEST_MODE
+                                           ? pa0_mode
+                                           : update_switch_filter(switch_filter, dbus.s2, now);
+        arm_remote_raw_mode = PA0_BUTTON_TEST_MODE ? pa0_mode : dbus.s2;
+        arm_requested_mode = requested_mode;
+
+        // 回放挡内不接受实时 S1，避免覆盖 Flash 中记录的夹爪动作。
+        // 返回起点期间保持进入回放前的夹爪状态；正式回放后由采样点驱动。
+        if (!PA0_BUTTON_TEST_MODE && requested_mode != 3U) {
+            update_gripper_from_remote(current_gripper_state);
+        }
+
+        // LB 从录制切到回放时先提交记录；START 已在上面的独立分支中停止并清空记录。
+        if (state == ControlState::Recording && requested_mode != 1U) {
+            if (!finalize_record(record_count, record_crc)) {
+                if (requested_mode == 0U) {
+                    // 非按键事件造成的停止仍优先保证电机安全失能。
+                    set_state(ControlState::Safe);
+                } else {
+                    enter_fault(FAULT_FLASH_PROGRAM);
+                    osDelay(5);
+                    continue;
+                }
+            } else {
+                set_state(ControlState::RecordStopped);
             }
         }
 
@@ -667,36 +1013,18 @@ void MotorTask::run() {
                 disable_all_motors(ABC);
                 motors_enabled = false;
             }
-            controls_armed = false;
+            // START 或通信超时后的停止状态同时解除故障锁存。
+            arm_fault_code = FAULT_NONE;
             set_state(ControlState::Safe);
             osDelay(5);
             continue;
         }
 
-        // 故障锁存：如果故障发生在手动挡，要求先把拨杆移开，再回到 2 才能重使能。
+        // 同一请求发生故障后保持锁存，直到收到下一次 RB/LB 单击或 START。
         if (state == ControlState::Fault) {
-            if (requested_mode != 2U) {
-                fault_manual_release_seen = true;
-                osDelay(5);
-                continue;
-            }
-            if (!fault_manual_release_seen) {
-                osDelay(5);
-                continue;
-            }
-            arm_fault_code = FAULT_NONE;
-            fault_manual_release_seen = false;
-            set_state(ControlState::Safe);
-        }
-
-        // 离开录制挡时提交头部。magic 最后写入，提交成功前记录始终无效。
-        if (state == ControlState::Recording && requested_mode != 1U) {
-            if (!finalize_record(record_count, record_crc)) {
-                enter_fault(FAULT_FLASH_PROGRAM);
-                osDelay(5);
-                continue;
-            }
-            set_state(ControlState::RecordStopped);
+            update_fault_blink(now, static_cast<FaultCode>(arm_fault_code));
+            osDelay(5);
+            continue;
         }
 
         if (requested_mode == 1U) {
@@ -722,8 +1050,9 @@ void MotorTask::run() {
 
             if (state == ControlState::Recording && tick_reached(now, record_next_tick)) {
                 JointSnapshot snapshot{};
-                if (!poll_disabled_feedback(ABC, snapshot)) {
-                    enter_fault(FAULT_FEEDBACK_TIMEOUT);
+                FaultCode poll_fault = FAULT_NONE;
+                if (!wait_for_mode_feedback(ABC, snapshot, poll_fault)) {
+                    enter_fault(poll_fault);
                     continue;
                 }
                 const uint32_t sample_now = HAL_GetTick();
@@ -731,10 +1060,9 @@ void MotorTask::run() {
                     enter_fault(FAULT_FEEDBACK_TIMEOUT);
                     continue;
                 }
-                if (feedback_has_error(snapshot)) {
-                    enter_fault(FAULT_MOTOR_ERROR);
-                    continue;
-                }
+                // 录制时电机保持失能，记录报码但不阻止位置采样。
+                // 回放使能前仍会严格检查并拒绝带故障电机。
+                feedback_has_error(snapshot);
                 if (!positions_are_safe(snapshot.pos)) {
                     enter_fault(FAULT_UNSAFE_SAMPLE);
                     continue;
@@ -770,8 +1098,9 @@ void MotorTask::run() {
 
                 JointSnapshot snapshot{};
                 // 失能状态下没有主动上报，进入手动前主动请求一次全关节反馈。
-                if (!poll_disabled_feedback(ABC, snapshot)) {
-                    enter_fault(FAULT_FEEDBACK_TIMEOUT);
+                FaultCode poll_fault = FAULT_NONE;
+                if (!wait_for_mode_feedback(ABC, snapshot, poll_fault)) {
+                    enter_fault(poll_fault);
                     osDelay(5);
                     continue;
                 }
@@ -835,8 +1164,9 @@ void MotorTask::run() {
             sample_to_positions(first_sample, playback.start);
 
             JointSnapshot snapshot{};
-            if (!poll_disabled_feedback(ABC, snapshot)) {
-                enter_fault(FAULT_FEEDBACK_TIMEOUT);
+            FaultCode poll_fault = FAULT_NONE;
+            if (!wait_for_mode_feedback(ABC, snapshot, poll_fault)) {
+                enter_fault(poll_fault);
                 continue;
             }
             if (!feedback_is_fresh(snapshot, HAL_GetTick())) {
@@ -975,7 +1305,7 @@ void MotorTask::run() {
             continue;
         }
 
-        // 回放结束后在 S2=3 持有最终位置；拨回中位会先同步当前位置再进入手动。
+        // 回放结束后保持最终位置；按 START 后由前面的停止分支立即失能。
         if (state == ControlState::PlaybackComplete) {
             if (!send_joint_positions(ABC, playback.last_command, RETURN_SPEED, 1U)) {
                 enter_fault(FAULT_CAN_TX);
