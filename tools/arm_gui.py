@@ -198,6 +198,8 @@ class ArmGui:
         self.btn_send = Button(plt.axes([0.78, 0.09, 0.09, 0.05]), "发送目标")
         self.btn_grip = Button(plt.axes([0.89, 0.09, 0.09, 0.05]), "夹爪开/合")
         self.chk_cont = CheckButtons(plt.axes([0.56, 0.015, 0.05, 0.055]), ["连续发送"], [False])
+        self.btn_home = Button(plt.axes([0.80, 0.015, 0.18, 0.045]), "回零")
+        self.btn_home.on_clicked(lambda _e: self.link.send(UC.T_GO_HOME))
         self.btn_enable.on_clicked(lambda _e: self.link.send(UC.T_SET_ENABLE, bytes([1])))
         self.btn_disable.on_clicked(lambda _e: self.link.send(UC.T_SET_ENABLE, bytes([0])))
         self.btn_send.on_clicked(lambda _e: self._send_target())

@@ -30,6 +30,7 @@ import time
 HEAD1, HEAD2 = 0xFE, 0xEF
 T_SET_ENABLE, T_MOVEJ, T_MOVEJ_QUEUE, T_MOVE_CART = 0x01, 0x02, 0x03, 0x04
 T_JOG, T_GRIPPER, T_HEARTBEAT, T_QUERY = 0x05, 0x06, 0x07, 0x08
+T_GO_HOME = 0x0A
 T_ACK, T_STATUS, T_JOINTS, T_POSE = 0x80, 0x81, 0x82, 0x83
 
 STATE_NAMES = {0: "Disabled", 1: "Ready", 2: "Moving", 3: "Fault"}
@@ -202,13 +203,15 @@ def main():
                     send(T_JOG, bytes([int(parts[1]) & 0xFF]) + struct.pack("<f", float(parts[2])))
                 elif cmd == "grip" and len(parts) == 2:
                     send(T_GRIPPER, bytes([1 if parts[1] in ("1", "on") else 0]))
+                elif cmd == "home":
+                    send(T_GO_HOME)
                 elif cmd == "q":
                     send(T_QUERY)
                 elif cmd == "hb" and len(parts) == 2:
                     hb_on[0] = parts[1] in ("1", "on")
                     print(f"心跳 {'开' if hb_on[0] else '关'}")
                 else:
-                    print("命令格式: en | dis | j f×6 | jq f×6 | c f×6 | jog i d | grip 0/1 | q | hb on/off")
+                    print("命令格式: en | dis | home | j f×6 | jq f×6 | c f×6 | jog i d | grip 0/1 | q | hb on/off")
             except ValueError:
                 print("数值格式错误")
     except (KeyboardInterrupt, EOFError):

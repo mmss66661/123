@@ -13,6 +13,7 @@
 //   0x06 GRIPPER      [u8 closed]        1=闭合 0=打开
 //   0x07 HEARTBEAT    []                 仅刷新链路计时（无 ACK）
 //   0x08 QUERY        []                 立即回一轮 STATUS/JOINTS/POSE
+//   0x0A GO_HOME      []                 自动回零：运动到标定零位(kHome 全零)
 //
 // 机械臂 -> 上位机：
 //   0x80 ACK          [u8 cmd, u8 status] 命令回执，status 见 RequestStatus

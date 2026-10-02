@@ -36,6 +36,7 @@ constexpr uint8_t kRxJog         = 0x05;
 constexpr uint8_t kRxGripper     = 0x06;
 constexpr uint8_t kRxHeartbeat   = 0x07;
 constexpr uint8_t kRxQuery       = 0x08;
+constexpr uint8_t kRxGoHome      = 0x0A;  // 自动回零：moveJ 到 kHome(标定零位)
 
 constexpr uint8_t kTxAck    = 0x80;
 constexpr uint8_t kTxStatus = 0x81;
@@ -200,6 +201,15 @@ void execCmd(const Cmd& c) {
             if (c.len < 1) break;
             armController.setGripper(c.payload[0] != 0U);
             sendAck(c.type, static_cast<uint8_t>(RequestStatus::Ok));
+            return;
+        }
+
+        case kRxGoHome: {
+            // 回零 = 关节空间运动到标定零位（kHome 全零，对应电机位置
+            // 1.83051/1.35863/0.60445/1.98768/4.97044/5.40341）
+            const RequestStatus st =
+                armController.moveJ(arm::config::kHome, now);
+            sendAck(c.type, static_cast<uint8_t>(st));
             return;
         }
 
