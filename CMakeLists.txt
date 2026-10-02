@@ -90,10 +90,14 @@ add_executable(${CMAKE_PROJECT_NAME}
         RobotArm/Inc/arm_hal.h
         RobotArm/Src/arm_controller.cpp
         RobotArm/Inc/arm_controller.h
+        RobotArm/Src/arm_protocol.cpp
+        RobotArm/Inc/arm_protocol.h
         RobotArm/Inc/arm_types.h
         RobotArm/Inc/arm_config.h
         Task/Src/armTask.cpp
-        Task/Inc/armTask.h)
+        Task/Inc/armTask.h
+        Task/Src/armDebugTask.cpp
+        Task/Inc/armDebugTask.h)
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)

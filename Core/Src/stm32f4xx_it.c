@@ -252,31 +252,11 @@ void TIM2_IRQHandler(void)
 void USART1_IRQHandler(void)
 {
   /* USER CODE BEGIN USART1_IRQn 0 */
-  const uint32_t status = huart1.Instance->SR;
-  const uint32_t error_flags = status &
-      (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE);
-
-  if (error_flags != 0U)
-  {
-    HC05_Gamepad_NotifyUartError();
-  }
-
-  if ((status & USART_SR_RXNE) != 0U)
-  {
-    const uint8_t byte = (uint8_t)(huart1.Instance->DR & 0xFFU);
-    if (error_flags == 0U)
-    {
-      HC05_Gamepad_FeedByte(byte);
-    }
-  }
-  else if (error_flags != 0U)
-  {
-    /* F4 UART 错误标志通过先读 SR、再读 DR 清除。 */
-    const volatile uint32_t discard = huart1.Instance->DR;
-    (void)discard;
-  }
+  /* 2026-10-02: HC-05 逐字节状态机已弃用；UART1 改为机械臂命令通道，
+   * 接收用 HAL_UARTEx_ReceiveToIdle_IT（见 RobotArm/Src/arm_protocol.cpp），
+   * 因此此处走标准 HAL 分发（含 TxCplt/RxEvent 回调）。 */
   /* USER CODE END USART1_IRQn 0 */
-  /* 不调用 HAL_UART_IRQHandler：该通道使用自定义逐字节接收状态机。 */
+  HAL_UART_IRQHandler(&huart1);
   /* USER CODE BEGIN USART1_IRQn 1 */
 
   /* USER CODE END USART1_IRQn 1 */

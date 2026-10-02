@@ -166,8 +166,10 @@ void motorToKin(const float motor_pos[config::kJointCount],
     }
     const float dm4 = motor_pos[4] - config::kWristM4Zero;
     const float dm5 = motor_pos[5] - config::kWristM5Zero;
-    q[4] = config::kWristRollGain * (dm4 + dm5);
-    q[5] = config::kWristPitchGain * (dm4 - dm5);
+    // 2026-10-02 实测：弯曲(pitch,差模)绕 ∥J2 的轴=q4；自旋(roll,共模)绕过
+    // TCP 的工具轴=q5
+    q[4] = config::kWristPitchGain * (dm4 - dm5);
+    q[5] = config::kWristRollGain * (dm4 + dm5);
 }
 
 void kinToMotor(const float q[config::kJointCount],
@@ -176,8 +178,8 @@ void kinToMotor(const float q[config::kJointCount],
         motor_out[i] = config::kJoints[i].zero_offset +
                        q[i] / config::kJoints[i].direction;
     }
-    const float roll = q[4] / config::kWristRollGain;
-    const float pitch = q[5] / config::kWristPitchGain;
+    const float pitch = q[4] / config::kWristPitchGain;
+    const float roll = q[5] / config::kWristRollGain;
     motor_out[4] = config::kWristM4Zero + 0.5f * (roll + pitch);
     motor_out[5] = config::kWristM5Zero + 0.5f * (roll - pitch);
 }

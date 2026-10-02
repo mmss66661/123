@@ -33,6 +33,9 @@ extern void USBTask_Init(void);
 /* 机械臂控制框架任务（RobotArm/）。与 MotorTask 驱动同一组电机，
  * 二者不能同时运行：启用 ArmTask 前先注释掉下方的 MotorTask_Init()。 */
 /* extern void ArmTask_Init(void); */
+/* 机械臂标定/调试任务：电机持续失能 + 100ms 轮询读取位置（USB 串口/Live Watch）。
+ * 用于零位标定；与 MotorTask/ArmTask 互斥，标定完切回 MotorTask_Init()。 */
+extern void ArmDebugTask_Init(void);
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -119,17 +122,20 @@ void MX_FREERTOS_Init(void) {
   //USB任务
   // USBTask_Init();
 
-  //电机驱动任务
-  MotorTask_Init();
+  //电机驱动任务（录制/回放）
+  //MotorTask_Init();   // 框架联调期间暂时关闭（与 ArmTask 互斥）
 
-  //机械臂控制框架任务：与上面的 MotorTask 互斥，切换时注释掉 MotorTask_Init()
-  //ArmTask_Init();
+  //机械臂控制框架任务（含 UART1 上位机命令通道）：与 MotorTask/ArmDebugTask 互斥
+  ArmTask_Init();
+
+  //机械臂标定/调试任务（标定已完成，2026-10-02 切回）
+  //ArmDebugTask_Init();
 
   //主板任务
   //MasterBoardTask_Init();
 
   //IMU任务
-   ImuTask_Init();
+   //ImuTask_Init();
   /* USER CODE END RTOS_THREADS */
 
 }

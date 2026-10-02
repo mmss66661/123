@@ -21,6 +21,8 @@ volatile float    arm_fw_ik_err_pos = 0.0f;
 volatile float    arm_fw_ik_err_rot = 0.0f;
 volatile float    arm_fw_traj_progress = 0.0f;
 volatile float    arm_fw_tracking_err = 0.0f;
+volatile uint8_t  arm_fw_motor_err_mask = 0;    // bit i = 电机 i 报码(状态 8~E)
+volatile uint8_t  arm_fw_fb_missing_mask = 0;   // bit i = 电机 i 反馈超时
 
 void ArmController::reset() {
     state_ = CtrlState::Disabled;
@@ -218,19 +220,30 @@ bool ArmController::checkFeedback(uint32_t now) {
     hal::MotorSnapshot snap;
     hal::readMotors(snap);
 
+    uint8_t missing = 0;
     for (std::size_t i = 0; i < config::kJointCount; ++i) {
         if (snap.rx_count[i] == 0U ||
             (now - snap.last_tick[i]) > config::kFeedbackTimeoutMs) {
-            enterFault(CtrlFault::FeedbackTimeout, now);
-            return false;
+            missing |= static_cast<uint8_t>(1U << i);
         }
     }
+    arm_fw_fb_missing_mask = missing;
+    if (missing != 0U) {
+        enterFault(CtrlFault::FeedbackTimeout, now);
+        return false;
+    }
+
+    uint8_t errmask = 0;
     for (std::size_t i = 0; i < config::kJointCount; ++i) {
         // 达妙状态 0(失能)/1(使能) 正常，8~E 为故障
         if (snap.err[i] >= 8U) {
-            enterFault(CtrlFault::MotorError, now);
-            return false;
+            errmask |= static_cast<uint8_t>(1U << i);
         }
+    }
+    arm_fw_motor_err_mask = errmask;
+    if (errmask != 0U) {
+        enterFault(CtrlFault::MotorError, now);
+        return false;
     }
     hal::motorToKin(snap.pos, q_measured_);
     return true;

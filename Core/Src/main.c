@@ -116,7 +116,8 @@ int main(void)
   BSP_DWT_Init();
   BSP_CAN_Init();
   HC05_Gamepad_Init();
-  __HAL_UART_ENABLE_IT(&huart1, UART_IT_RXNE);    // HC-05: PB7, 9600 8N1
+  // 2026-10-02: UART1 的 HC-05 逐字节接收已弃用，UART1(115200) 改为
+  // 机械臂上位机命令通道（RobotArm/Src/arm_protocol.cpp，由 ArmTask 启动接收）
   Uart_Init(&huart3, DBUS_Decode);               //接收dbus信息
    __HAL_UART_ENABLE_IT(&huart6, UART_IT_RXNE);   //接收裁判系统信息
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 2500);//2000是闭合，2500是打开

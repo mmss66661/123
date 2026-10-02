@@ -126,6 +126,8 @@ extern volatile float    arm_fw_ik_err_pos;   // m
 extern volatile float    arm_fw_ik_err_rot;   // rad
 extern volatile float    arm_fw_traj_progress;
 extern volatile float    arm_fw_tracking_err; // rad
+extern volatile uint8_t  arm_fw_motor_err_mask;   // bit i = 电机 i 报码
+extern volatile uint8_t  arm_fw_fb_missing_mask;  // bit i = 电机 i 反馈超时
 
 }  // namespace arm
 

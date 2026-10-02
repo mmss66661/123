@@ -267,20 +267,16 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef* timHandle)
   /* USER CODE BEGIN TIM1_MspPostInit 0 */
 
   /* USER CODE END TIM1_MspPostInit 0 */
-    __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOE_CLK_ENABLE();
     /**TIM1 GPIO Configuration
-    PA9     ------> TIM1_CH2
     PE13     ------> TIM1_CH3
     PE9     ------> TIM1_CH1
     PE14     ------> TIM1_CH4
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_9;
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    GPIO_InitStruct.Alternate = GPIO_AF1_TIM1;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    /* 2026-10-02: 原此处将 PA9 配为 TIM1_CH2（从未启动过的通道），且本函数在
+     * MX_USART1_UART_Init 之后执行，会把 USART1_TX(PA9, AF7) 覆盖掉，导致
+     * UART1 发送引脚失效。TIM1_CH2 固件未使用，PA9 已归还给 USART1_TX。
+     * !!! 若用 CubeMX 重新生成代码，需在 .ioc 里把 PA9 从 TIM1_CH2 释放 !!! */
 
     GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_9|GPIO_PIN_14;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;

@@ -66,8 +66,8 @@ def line_closest_feet(p1, d1, p2, d2):
     r = v_sub(p2, p1)
     b = v_dot(d1, d2)
     denom = 1.0 - b * b
-    if denom < 1e-12:  # 平行
-        t = v_dot(r, d2)
+    if denom < 1e-12:  # 平行：line2 上离 p1 最近的点
+        t = -v_dot(r, d2)
         return p1, v_add(p2, v_scale(d2, t))
     s = (v_dot(r, d1) - b * v_dot(r, d2)) / denom
     t = s * b - v_dot(r, d2)

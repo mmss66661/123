@@ -24,11 +24,12 @@ constexpr std::size_t kJointCount = 6;
 // =========================================================================
 // 1. 标定状态总开关
 // =========================================================================
-// DH 参数与零位尚未实测时保持 false：
-//   - moveJ / jog / 录制回放原有功能不受影响（关节空间控制不依赖几何参数）
-//   - moveCartesian（末端位姿控制）会直接返回 NotCalibrated
-// 测量填好第 3 节 DH 表和第 2 节零位后改为 true。
-constexpr bool kDhParamsMeasured = false;
+// 2026-10-02 标定完成并逐项验证：
+//   DH（CAD 轴线提取，往返校验 ~1e-16）、六个关节零位（实测）、软件限位
+//   （已换算运动学坐标系）、J0~J3 方向（+1）、差速腕映射（q4=pitch 差模
+//   +0.5，q5=roll 共模 -0.2577，q5 正方向为用户约定）、J3/J5 共线（ZYZ 腕）。
+// moveJ/jog/moveCartesian 全部可用。
+constexpr bool kDhParamsMeasured = true;
 
 // =========================================================================
 // 2. 关节-电机映射与软件限位
@@ -52,20 +53,34 @@ struct JointConfig {
 };
 
 constexpr JointConfig kJoints[kJointCount] = {
-    //  name             can_id  dir   zero_offset  limit_lo     limit_hi     limits  max_vel
-    { "J0_base_yaw",    0x02,  +1.0f, 0.0f, 1.72713089f, 5.405096f,    true,  2.0f },
-    { "J1_shoulder",    0x03,  +1.0f, 0.0f, 1.05001163f, 2.27759933f,  true,  2.0f },
-    { "J2_elbow",       0x04,  +1.0f, 0.0f, 0.00324249f, 1.84920311f,  true,  2.0f },
-    { "J3_forearm_yaw", 0x05,  +1.0f, 0.0f, 0.0f,        0.0f,         false, 2.0f },
-    { "J4_wrist_roll",  0x06,  +1.0f, 0.0f, 0.0f,        0.0f,         false, 2.0f },
-    { "J5_wrist_pitch", 0x07,  +1.0f, 0.0f, -2.08094978f, 2.83817816f, true,  2.0f },
+    //  name             can_id  dir   zero_offset   limit_lo     limit_hi    limits  max_vel
+    //  零位实测 2026-10-02（CAD 零位姿态，ArmDebugTask 读取）；
+    //  limit 已由电机坐标换算到运动学坐标（原值 - zero_offset）
+    //  J0/J1/J2 限位为 2026-10-02 机械限位实测（运动学坐标，手扳到限位读 q）
+    { "J0_base_yaw",    0x02,  +1.0f, 1.83051f,  0.0f,      3.649f,    true,  2.0f },
+    { "J1_shoulder",    0x03,  +1.0f, 1.35863f,  1.05f,     2.23f,     true,  2.0f },
+    { "J2_elbow",       0x04,  +1.0f, 0.60445f,  0.0f,      1.84f,     true,  2.0f },
+    { "J3_forearm_yaw", 0x05,  +1.0f, 1.98768f,  0.0f,      0.0f,      false,  2.0f },
+    //  2026-10-02 实测修正：腕部语义与最初假设相反——弯曲(pitch,差模)绕 ∥J2
+    //  的轴（存储 J4 线），自旋(roll,共模)绕过 TCP 的工具轴（存储 J5 线）。
+    //  DH 链几何不变，仅交换两关节的控制映射/增益/限位。
+    //  J4 限位：原 J45 软件限位(-2.08095~2.83818 定义在 m4-m5 上) × 0.5(物理
+    //  pitch = 0.5*(m4-m5)) + 零位差值补偿 0.216485 = -0.82399 ~ 1.63557
+    { "J4_wrist_pitch", 0x06,  +1.0f, 0.0f,     -0.82399f,  1.63557f,  true,  2.0f },
+    { "J5_wrist_roll",  0x07,  +1.0f, 0.0f,      0.0f,      0.0f,      false, 2.0f },
 };
 
-// 差速腕参数（J4/J5 与 0x06/0x07 两电机的合成关系）
-constexpr float kWristRollGain  = 0.5f;  // [未测量] 共模(和) -> roll 传动比例
-constexpr float kWristPitchGain = 1.0f;  // 差模(差) -> pitch，现有手动控制按 m4-m5 定义
-constexpr float kWristM4Zero    = 0.0f;  // [未测量] 腕零位时 0x06 电机反馈位置 rad
-constexpr float kWristM5Zero    = 0.0f;  // [未测量] 腕零位时 0x07 电机反馈位置 rad
+// 差速腕参数（2026-10-02 实测：弯曲轴=存储J4线，自旋轴=存储J5线/TCP工具轴）
+//   q4(pitch,弯曲) = kWristPitchGain * (Δm4 - Δm5)   差模，带机械限位
+//   q5(roll,自旋)  = kWristRollGain  * (Δm4 + Δm5)   共模，无限位
+// 纯 pitch 时末端角 = 单电机变化量；纯 roll 90° 时单电机变化 ~3.048 rad
+// （理论常见值 0.25 对应 π，可拧 180° 复测：单电机 ~6.28 → 0.25，~5.86 → 0.2577）
+constexpr float kWristPitchGain = -0.5f;    // pitch = kP * (Δm4 - Δm5)；负号经
+                                             // 实机-渲染对照验证（2026-10-02 曾随
+                                             // 整体回退被误退回 +0.5，现恢复）
+constexpr float kWristRollGain  = -0.2577f; // roll = kR * (Δm4 + Δm5)；q5正 = 共模减小（用户规定 2026-10-02）
+constexpr float kWristM4Zero    = 4.97044f;  // 腕零位时 0x06 电机反馈位置 rad
+constexpr float kWristM5Zero    = 5.40341f;  // 腕零位时 0x07 电机反馈位置 rad
 
 // =========================================================================
 // 3. DH 参数（标准 DH 约定，全部 [未测量] 占位值）
@@ -94,12 +109,12 @@ constexpr DhRow kDh[kJointCount] = {
     /* J1 大臂pitch */ { 0.000000f, 0.210999f,  1.57079633f,  2.35619449f },
     /* J2 肘        */ { 0.016000f, 0.000000f,  1.57079633f,  2.35619464f },
     /* J3 前臂      */ { 0.272900f, 0.000000f,  1.57079662f, -3.13697835f },
-    /* J4 腕roll    */ { 0.000000f, 0.000000f,  1.57079604f,  0.00000000f },
-    /* J5 法兰/TCP  */ { -0.118233f, 0.003499f, 0.00000000f, -2.36874442f },
+    /* J4 腕pitch   */ { 0.000000f, 0.000000f,  1.57079604f,  0.00000000f },
+    /* J5 腕roll/TCP*/ { -0.118233f, 0.003499f, 0.00000000f, -2.36874442f },
 };
 
-// 使能后的安全姿态（默认取各限位中点；零位标定后可改为标定零位）
-constexpr float kHome[kJointCount] = { 3.566f, 1.664f, 0.926f, 0.0f, 0.0f, 0.379f };
+// 使能后的安全姿态：标定零位（= CAD 零位姿态）
+constexpr float kHome[kJointCount] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 
 // =========================================================================
 // 4. 轨迹规划与 IK 参数
@@ -137,6 +152,15 @@ constexpr uint32_t kGripperCloseCh1 = 2000;
 constexpr uint32_t kGripperCloseCh3 = 1700;
 constexpr uint32_t kGripperOpenCh1  = 2500;
 constexpr uint32_t kGripperOpenCh3  = 1200;
+
+// =========================================================================
+// 6. UART1 上位机命令通道（115200 8N1，见 RobotArm/Src/arm_protocol.cpp）
+// =========================================================================
+constexpr uint32_t kUartTelemetryMs   = 50;    // 遥测调度周期（轮转发一帧：
+                                               // STATUS/JOINTS/POSE 各 ~150ms 一次）
+// 链路超时失能保护已于 2026-10-02 按用户要求移除（排查"使能1秒后失能"期间
+// 用户明确要求删除）。剩余保护：反馈超时/电机报码/CAN失败/跟踪超时。
+// 若需恢复：在 ArmProtocol_Tick 中重建"超时无帧 -> disable"逻辑。
 
 }  // namespace config
 }  // namespace arm
